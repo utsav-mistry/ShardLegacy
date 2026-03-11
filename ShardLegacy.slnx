@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="shardlegacy.client/shardlegacy.client.esproj">
+    <Build />
+    <Deploy />
+  </Project>
+  <Project Path="ShardLegacy.Server/ShardLegacy.Server.csproj" />
+</Solution>
