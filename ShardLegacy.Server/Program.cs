@@ -1,3 +1,5 @@
+using ShardLegacy.Server.Services;
+
 namespace ShardLegacy.Server
 {
     public class Program
@@ -6,7 +8,13 @@ namespace ShardLegacy.Server
         {
             var builder = WebApplication.CreateBuilder(args);
 
-            builder.Services.AddControllers();
+            builder.Services.AddSingleton<DeploymentService>();
+
+            builder.Services.AddControllers()
+                .AddJsonOptions(options =>
+                {
+                    options.JsonSerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
+                });
 
             builder.Services.AddEndpointsApiExplorer();
             builder.Services.AddSwaggerGen();
