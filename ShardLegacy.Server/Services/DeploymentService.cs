@@ -1,6 +1,8 @@
+using MongoDB.Driver;
 using ShardLegacy.Server.Models;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Channels;
 
 namespace ShardLegacy.Server.Services
@@ -30,12 +32,16 @@ namespace ShardLegacy.Server.Services
         private readonly string _nginxConfigPath;
         private readonly string _nginxMainConf;
         private readonly ILogger<DeploymentService> _logger;
+        private readonly MongoDbService? _mongo;
+        private readonly SemaphoreSlim _persistLock = new(1, 1);
 
         private const string NginxContainerName = "shard-nginx-proxy";
 
-        public DeploymentService(ILogger<DeploymentService> logger, IConfiguration config)
+        public DeploymentService(ILogger<DeploymentService> logger, IConfiguration config, MongoDbService? mongo = null)
         {
             _logger = logger;
+            _mongo = mongo;
+
             _workspacePath = config.GetValue<string>("Deployment:WorkspacePath")
                 ?? Path.Combine(Path.GetTempPath(), "shardlegacy-deployments");
             _nginxConfigPath = Path.Combine(Path.GetTempPath(), "shardlegacy-nginx", "conf.d");
@@ -46,6 +52,52 @@ namespace ShardLegacy.Server.Services
 
             // Write the main nginx.conf
             WriteMainNginxConf();
+        }
+
+        public async Task InitializeAsync()
+        {
+            if (_mongo?.IsConnected != true) return;
+
+            try
+            {
+                var saved = await _mongo.Deployments!.Find(_ => true).ToListAsync();
+                lock (_lock)
+                {
+                    _deployments.Clear();
+                    _deployments.AddRange(saved);
+
+                    var maxPort = _deployments.Any() ? _deployments.Max(d => d.AssignedPort) : 0;
+                    if (maxPort >= _nextPort) _nextPort = maxPort + 1;
+                }
+
+                _logger.LogInformation("Loaded {Count} deployments from MongoDB.", _deployments.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to load deployments from MongoDB.");
+            }
+        }
+
+        private async Task PersistDeploymentAsync(ProjectDeployment dep)
+        {
+            if (_mongo?.IsConnected != true) return;
+
+            await _persistLock.WaitAsync();
+            try
+            {
+                await _mongo.Deployments!.ReplaceOneAsync(
+                    d => d.Id == dep.Id,
+                    dep,
+                    new ReplaceOptions { IsUpsert = true });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to persist deployment {Id}.", dep.Id);
+            }
+            finally
+            {
+                _persistLock.Release();
+            }
         }
 
         // ── Public API ─────────────────────────────────────────────────
@@ -82,6 +134,7 @@ namespace ShardLegacy.Server.Services
             }
 
             _deployments.Add(deployment);
+            _ = PersistDeploymentAsync(deployment);
             return deployment;
         }
 
@@ -554,6 +607,7 @@ server {{
                     await RunCmd("docker", $"exec {NginxContainerName} nginx -s reload");
 
                 dep.Status = "stopped";
+                _ = PersistDeploymentAsync(dep);
                 return true;
             }
             catch (Exception ex)
@@ -568,6 +622,12 @@ server {{
             var dep = GetById(id);
             if (dep == null) return false;
             _deployments.Remove(dep);
+
+            if (_mongo?.IsConnected == true)
+            {
+                _ = _mongo.Deployments!.DeleteOneAsync(d => d.Id == id);
+            }
+
             return true;
         }
 
@@ -641,6 +701,8 @@ server {{
             var end = new LogEntry { Level = "done", Message = "__STREAM_END__", Stage = "_system" };
             await Broadcast(dep.Id, end);
 
+            _ = PersistDeploymentAsync(dep);
+
             if (_logChannels.TryGetValue(dep.Id, out var list))
                 lock (list) { foreach (var ch in list) ch.Writer.TryComplete(); }
         }
@@ -658,6 +720,8 @@ server {{
                 if (s.StartedAt.HasValue)
                     s.DurationMs = (long)(s.CompletedAt.Value - s.StartedAt.Value).TotalMilliseconds;
             }
+
+            _ = PersistDeploymentAsync(dep);
         }
 
         private static string DetectFramework(string path)
