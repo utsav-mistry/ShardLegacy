@@ -15,6 +15,7 @@ namespace ShardLegacy.Server.Services
         private static bool _nginxRunning = false;
 
         private static readonly ConcurrentDictionary<string, List<Channel<LogEntry>>> _logChannels = new();
+        private static readonly ConcurrentDictionary<string, CancellationTokenSource> _logStreamTokens = new();
 
         private static readonly string[] Adjectives =
         {
@@ -280,9 +281,22 @@ namespace ShardLegacy.Server.Services
                     var cn = $"shard-{projectName}-{deployment.Id}";
                     await Emit(deployment, "info", $"Container: {cn}", "deploy");
 
-                    // Try common internal ports: 80, 8080, 3000, 5000
+                    // Parse Dockerfile to detect exposed port
+                    var dockerfilePath = Path.Combine(projectPath, selectedFile);
+                    var detectedPort = ParseDockerfilePort(dockerfilePath);
+                    
+                    // Fallback to common ports if detection fails
+                    var portsToTry = detectedPort.HasValue
+                        ? new[] { detectedPort.Value }.Concat(new[] { 80, 8080, 3000, 5000 }).Distinct().ToArray()
+                        : new[] { 80, 8080, 3000, 5000 };
+
+                    if (detectedPort.HasValue)
+                        await Emit(deployment, "info", $"Detected port in Dockerfile: {detectedPort}", "deploy");
+
                     string? containerId = null;
-                    foreach (var iPort in new[] { 80, 8080, 3000, 5000 })
+                    int? actualInternalPort = null;
+
+                    foreach (var iPort in portsToTry)
                     {
                         var run = await RunCmd("docker",
                             $"run -d --name {cn} -p {port}:{iPort} {deployment.ImageName}");
@@ -291,15 +305,21 @@ namespace ShardLegacy.Server.Services
                         {
                             containerId = run.StdOut.Trim();
                             if (containerId.Length > 12) containerId = containerId[..12];
+                            actualInternalPort = iPort;
                             await Emit(deployment, "info",
-                                $"Mapped :{port} -> :{iPort}", "deploy");
+                                $"Mapped external :{port} -> internal :{iPort}", "deploy");
                             break;
                         }
 
                         // Clean up failed attempt
                         await RunCmd("docker", $"rm -f {cn}");
-                        await Emit(deployment, "warn",
-                            $"Port {iPort} failed, trying next...", "deploy");
+                        
+                        if (iPort == detectedPort)
+                            await Emit(deployment, "warn",
+                                $"Detected port {iPort} failed. Trying fallback ports...", "deploy");
+                        else
+                            await Emit(deployment, "warn",
+                                $"Port {iPort} failed, trying next...", "deploy");
                     }
 
                     if (containerId == null)
@@ -312,6 +332,7 @@ namespace ShardLegacy.Server.Services
                     }
 
                     deployment.ContainerId = containerId;
+                    deployment.InternalPort = actualInternalPort ?? 0;
                     await Emit(deployment, "success", $"Container running: {containerId}", "deploy");
                 }
                 SetStage(deployment, 3, "completed");
@@ -379,6 +400,12 @@ namespace ShardLegacy.Server.Services
                     $"Deployment complete in {FmtMs(deployment.DurationMs)}.", "");
                 await Emit(deployment, "info", $"Site URL: {deployment.FullUrl}", "");
                 await Emit(deployment, "info", $"Direct:   {deployment.DirectUrl}", "");
+                
+                // Signal client to open WebSocket for live container logs
+                await Emit(deployment, "info", "🔌 Opening live container log stream...", "logs");
+
+                // Start container log streaming in background
+                _ = Task.Run(() => StreamContainerLogsAsync(deployment));
             }
             catch (Exception ex)
             {
@@ -514,6 +541,92 @@ server {{
             if (File.Exists(path)) File.Delete(path);
         }
 
+        // ── Container Log Streaming ────────────────────────────────────
+
+        private async Task StreamContainerLogsAsync(ProjectDeployment deployment)
+        {
+            var cts = new CancellationTokenSource();
+            if (!_logStreamTokens.TryAdd(deployment.Id, cts))
+            {
+                // Another log streamer is already running
+                cts.Dispose();
+                return;
+            }
+
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "docker",
+                    Arguments = $"logs -f {deployment.ContainerId}",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using var proc = new Process { StartInfo = psi };
+                proc.Start();
+
+                using var reader = proc.StandardOutput;
+                string? line;
+                while ((line = await reader.ReadLineAsync()) != null)
+                {
+                    // Check if token is cancelled and not disposed
+                    if (_logStreamTokens.TryGetValue(deployment.Id, out var tokenSource))
+                    {
+                        if (tokenSource.IsCancellationRequested) break;
+                    }
+                    else
+                    {
+                        // Token source was removed/disposed
+                        break;
+                    }
+                    if (!string.IsNullOrWhiteSpace(line))
+                    {
+                        await Emit(deployment, "log", line, "logs");
+                    }
+                }
+
+                // Wait for process to complete
+                if (_logStreamTokens.TryGetValue(deployment.Id, out var waitTokenSource))
+                {
+                    await proc.WaitForExitAsync(waitTokenSource.Token);
+                }
+                else
+                {
+                    await proc.WaitForExitAsync();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Streaming stopped
+            }
+            catch (ObjectDisposedException)
+            {
+                // Token was disposed, safe to ignore
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Container log streaming failed for {Id}", deployment.Id);
+            }
+            finally
+            {
+                _logStreamTokens.TryRemove(deployment.Id, out var removedCts);
+                // Only dispose if this is the same instance
+                removedCts?.Dispose();
+            }
+        }
+
+        private void StopContainerLogStreaming(string deploymentId)
+        {
+            if (_logStreamTokens.TryRemove(deploymentId, out var cts))
+            {
+                cts.Cancel();
+                cts.Dispose();
+            }
+        }
+
         // ── Scan ───────────────────────────────────────────────────────
 
         public async Task<ScanResult> ScanSource(string source)
@@ -593,6 +706,9 @@ server {{
 
             try
             {
+                // Stop log streaming
+                StopContainerLogStreaming(id);
+
                 if (dep.DetectedFile.Contains("compose", StringComparison.OrdinalIgnoreCase))
                     await RunCmd("docker", $"compose -p {dep.ProjectName} down");
                 else
@@ -646,6 +762,18 @@ server {{
             var ch = Channel.CreateUnbounded<LogEntry>();
             var list = _logChannels.GetOrAdd(deploymentId, _ => new List<Channel<LogEntry>>());
             lock (list) { list.Add(ch); }
+
+            // --- Ensure log streaming is running for active containers ---
+            var dep = GetById(deploymentId);
+            if (dep != null && dep.Status == "running" && !string.IsNullOrEmpty(dep.ContainerId))
+            {
+                // If not already streaming logs for this deployment, start it
+                if (!_logStreamTokens.ContainsKey(deploymentId))
+                {
+                    _ = Task.Run(() => StreamContainerLogsAsync(dep));
+                }
+            }
+
             return ch;
         }
 
@@ -722,6 +850,39 @@ server {{
             }
 
             _ = PersistDeploymentAsync(dep);
+        }
+
+        private static int? ParseDockerfilePort(string dockerfilePath)
+        {
+            try
+            {
+                if (!File.Exists(dockerfilePath)) return null;
+
+                var lines = File.ReadAllLines(dockerfilePath);
+                foreach (var line in lines)
+                {
+                    var trimmed = line.Trim();
+                    
+                    // Match EXPOSE instruction
+                    if (trimmed.StartsWith("EXPOSE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = trimmed.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length >= 2)
+                        {
+                            // Extract port number (handle "EXPOSE 5000" or "EXPOSE 5000/tcp")
+                            var portStr = parts[1].Split('/')[0];
+                            if (int.TryParse(portStr, out var port) && port > 0 && port < 65536)
+                                return port;
+                        }
+                    }
+                }
+
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static string DetectFramework(string path)

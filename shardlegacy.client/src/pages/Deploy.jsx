@@ -69,15 +69,17 @@ export default function Deploy() {
     const [projectName, setProjectName] = useState('');
     const [envVars, setEnvVars] = useState([]);
 
+
+
     const [activeDeployment, setActiveDeployment] = useState(null);
     const [liveLogs, setLiveLogs] = useState([]);
     const [liveStages, setLiveStages] = useState([]);
     const [streaming, setStreaming] = useState(false);
-
+    const [liveMode, setLiveMode] = useState(true);
+    const wsRef = useRef(null);
+    const eventSourceRef = useRef(null);
     const [deployments, setDeployments] = useState([]);
     const [nginxConfig, setNginxConfig] = useState(null);
-
-    const eventSourceRef = useRef(null);
 
     const fetchDeployments = useCallback(() => {
         fetch('/api/projects').then(r => r.ok ? r.json() : []).then(setDeployments).catch(() => { });
@@ -85,10 +87,61 @@ export default function Deploy() {
 
     useEffect(() => { fetchDeployments(); }, [fetchDeployments]);
 
-    // Clean up SSE on unmount
-    useEffect(() => { return () => { eventSourceRef.current?.close(); }; }, []);
+    // Clean up streams on unmount
+    useEffect(() => {
+        return () => {
+            eventSourceRef.current?.close();
+            wsRef.current?.close();
+        };
+    }, []);
 
+    // --- WebSocket connection for live logs ---
+    const connectWS = useCallback((deployId) => {
+        eventSourceRef.current?.close();
+        wsRef.current?.close();
+        setStreaming(true);
+
+        const ws = new WebSocket(
+            `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/projects/${deployId}/logs/ws`
+        );
+        wsRef.current = ws;
+
+        ws.onmessage = (ev) => {
+            try {
+                const entry = JSON.parse(ev.data);
+                if (entry.level === 'stage_update') {
+                    setLiveStages(JSON.parse(entry.message));
+                    return;
+                }
+                if (entry.level === 'done') {
+                    ws.close();
+                    setStreaming(false);
+                    fetchDeployments();
+                    return;
+                }
+                setLiveLogs(prev => [...prev, entry]);
+            } catch { }
+        };
+
+        ws.onopen = () => {
+            setStreaming(true);
+        };
+
+        ws.onclose = () => {
+            setStreaming(false);
+            fetchDeployments();
+        };
+
+        ws.onerror = () => {
+            ws.close();
+            setStreaming(false);
+            fetchDeployments();
+        };
+    }, [fetchDeployments]);
+
+    // --- SSE connection for pipeline logs ---
     const connectSSE = useCallback((deployId) => {
+        wsRef.current?.close();
         eventSourceRef.current?.close();
         setLiveLogs([]);
         setLiveStages([]);
@@ -105,14 +158,20 @@ export default function Deploy() {
                     es.close();
                     setStreaming(false);
                     fetchDeployments();
-                    fetch(`/api/projects/${deployId}`).then(r => r.ok ? r.json() : null).then(d => {
-                        if (d) setActiveDeployment(d);
-                    });
                     return;
                 }
 
                 if (entry.level === 'stage_update') {
-                    try { setLiveStages(JSON.parse(entry.message)); } catch { }
+                    setLiveStages(JSON.parse(entry.message));
+                    return;
+                }
+
+                // Check if this is the signal to switch to WebSocket
+                if (liveMode && entry.message?.includes('Opening live container log stream')) {
+                    setLiveLogs(prev => [...prev, entry]);
+                    es.close();
+                    // Switch to WebSocket for live logs
+                    setTimeout(() => connectWS(deployId), 500);
                     return;
                 }
 
@@ -125,7 +184,9 @@ export default function Deploy() {
             setStreaming(false);
             fetchDeployments();
         };
-    }, [fetchDeployments]);
+    }, [fetchDeployments, liveMode, connectWS]);
+
+
 
     const handleScan = () => {
         if (!source.trim()) return;
@@ -174,7 +235,17 @@ export default function Deploy() {
                 setScanResult(null);
                 setActiveDeployment(data);
                 setLiveStages(data.stages || []);
-                if (data.id) connectSSE(data.id);
+                setLiveLogs(liveMode ? [] : (data.logs || []));
+                if (data.id) {
+                    // Immediately add to deployments for UI feedback
+                    setDeployments(prev => {
+                        // Avoid duplicates if backend already included it
+                        if (prev.some(d => d.id === data.id)) return prev;
+                        return [data, ...prev];
+                    });
+                    // Always use SSE first to show pipeline logs, then switch to WS if liveMode
+                    connectSSE(data.id);
+                }
             })
             .catch(() => setDeploying(false));
     };
@@ -192,14 +263,27 @@ export default function Deploy() {
 
     const showLogs = (dep) => {
         eventSourceRef.current?.close();
+        wsRef.current?.close();
         setActiveDeployment(dep);
-        setLiveLogs(dep.logs || []);
+        setLiveLogs(liveMode ? [] : (dep.logs || []));
         setLiveStages(dep.stages || []);
         if (dep.status === 'deploying') {
+            // Always use SSE first to show pipeline logs
             connectSSE(dep.id);
         } else {
             setStreaming(false);
         }
+    };
+
+    const toggleLiveMode = () => {
+        setLiveMode((prev) => {
+            const next = !prev;
+            if (activeDeployment?.id && activeDeployment.status === 'deploying') {
+                if (next) connectWS(activeDeployment.id);
+                else connectSSE(activeDeployment.id);
+            }
+            return next;
+        });
     };
 
     const viewNginx = (id) => {
@@ -318,8 +402,8 @@ export default function Deploy() {
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                             <span className="card-title">{activeDeployment.projectName || 'Deploying...'}</span>
                             <span className={`badge ${activeDeployment.status === 'running' ? 'badge-green' :
-                                    activeDeployment.status === 'deploying' ? 'badge-blue' :
-                                        activeDeployment.status === 'failed' ? 'badge-red' : 'badge-gray'
+                                activeDeployment.status === 'deploying' ? 'badge-blue' :
+                                    activeDeployment.status === 'failed' ? 'badge-red' : 'badge-gray'
                                 }`}>
                                 {streaming && <div className="spinner spinner-sm" />}
                                 {!streaming && <span className="badge-dot" />}
@@ -334,8 +418,12 @@ export default function Deploy() {
                                 <a href={activeDeployment.fullUrl} target="_blank" rel="noreferrer"
                                     className="btn btn-sm btn-success">Open Site</a>
                             )}
+                            <button className={`btn btn-sm ${liveMode ? 'btn-primary' : ''}`} onClick={toggleLiveMode}>
+                                Live: {liveMode ? 'On' : 'Off'}
+                            </button>
                             <button className="btn btn-sm" onClick={() => {
                                 eventSourceRef.current?.close();
+                                wsRef.current?.close();
                                 setActiveDeployment(null); setLiveLogs([]); setLiveStages([]);
                             }}>Close</button>
                         </div>
@@ -420,8 +508,8 @@ export default function Deploy() {
                                 </td>
                                 <td>
                                     <span className={`badge ${dep.status === 'running' ? 'badge-green' :
-                                            dep.status === 'deploying' ? 'badge-blue' :
-                                                dep.status === 'failed' ? 'badge-red' : 'badge-gray'
+                                        dep.status === 'deploying' ? 'badge-blue' :
+                                            dep.status === 'failed' ? 'badge-red' : 'badge-gray'
                                         }`}>
                                         {dep.status === 'deploying' && <div className="spinner spinner-sm" />}
                                         {dep.status !== 'deploying' && <span className="badge-dot" />}

@@ -16,6 +16,7 @@ namespace ShardLegacy.Server.Models
         public string ContainerId { get; set; } = string.Empty;
         public string ImageName { get; set; } = string.Empty;
         public int AssignedPort { get; set; }
+        public int InternalPort { get; set; }
         public string Subdomain { get; set; } = string.Empty;
         public string FullUrl { get; set; } = string.Empty;
         public string DirectUrl { get; set; } = string.Empty;

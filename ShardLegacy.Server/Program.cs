@@ -47,6 +47,9 @@ namespace ShardLegacy.Server
             app.UseDefaultFiles();
             app.MapStaticAssets();
 
+            // Enable WebSockets for live log streaming
+            app.UseWebSockets();
+
             if (app.Environment.IsDevelopment())
             {
                 app.UseSwagger();

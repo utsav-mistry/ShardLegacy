@@ -7,6 +7,9 @@ import path from 'path';
 import child_process from 'child_process';
 import { env } from 'process';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const baseFolder =
     env.APPDATA !== undefined && env.APPDATA !== ''
         ? `${env.APPDATA}/ASP.NET/https`
@@ -34,10 +37,54 @@ if (!fs.existsSync(certFilePath) || !fs.existsSync(keyFilePath)) {
     }
 }
 
-const target = env.ASPNETCORE_HTTPS_PORT ? `https://localhost:${env.ASPNETCORE_HTTPS_PORT}` :
-    env.ASPNETCORE_URLS ? env.ASPNETCORE_URLS.split(';')[0] : 'https://localhost:7048';
+let target = null;
 
-// https://vitejs.dev/config/
+// Prefer explicit HTTPS port if provided
+if (env.ASPNETCORE_HTTPS_PORT) {
+    target = `https://localhost:${env.ASPNETCORE_HTTPS_PORT}`;
+} else if (env.ASPNETCORE_URLS) {
+    target = env.ASPNETCORE_URLS.split(';')[0];
+} else {
+    // Fallback: try to read the server's launchSettings.json to discover the applicationUrl
+    try {
+        const launchPath = path.resolve(__dirname, '../ShardLegacy.Server/Properties/launchSettings.json');
+        if (fs.existsSync(launchPath)) {
+            const launchJson = JSON.parse(fs.readFileSync(launchPath, { encoding: 'utf8' }));
+            const profiles = launchJson && launchJson.profiles;
+            if (profiles) {
+                // Prefer the https profile, then https-like entries, then any with applicationUrl
+                const profileOrder = ['https', 'http'];
+                let appUrl = null;
+                for (const name of profileOrder) {
+                    if (profiles[name] && profiles[name].applicationUrl) {
+                        appUrl = profiles[name].applicationUrl;
+                        break;
+                    }
+                }
+
+                if (!appUrl) {
+                    for (const key of Object.keys(profiles)) {
+                        if (profiles[key] && profiles[key].applicationUrl) {
+                            appUrl = profiles[key].applicationUrl;
+                            break;
+                        }
+                    }
+                }
+
+                if (appUrl) {
+                    // applicationUrl may contain multiple urls separated by ';' - pick the first
+                    target = appUrl.split(';')[0];
+                }
+            }
+        }
+    } catch (e) {
+        // ignore and fall back to default
+    }
+
+    // final default if nothing found
+    if (!target) target = 'https://localhost:7048';
+}
+
 export default defineConfig({
     plugins: [plugin()],
     resolve: {
@@ -63,3 +110,5 @@ export default defineConfig({
         }
     }
 })
+// Print resolved backend target so it's obvious where the proxy will forward requests
+console.log(`[vite] proxy target -> ${target}`);

@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using ShardLegacy.Server.Models;
 using ShardLegacy.Server.Services;
+using System.Net.WebSockets;
 using System.Text.Json;
 
 namespace ShardLegacy.Server.Controllers
@@ -100,6 +101,49 @@ namespace ShardLegacy.Server.Controllers
             finally
             {
                 _svc.Unsubscribe(id, channel);
+            }
+        }
+
+        /// <summary>
+        /// WebSocket endpoint: streams deployment logs over a WS connection.
+        /// </summary>
+        [HttpGet("{id}/logs/ws")]
+        public async Task GetLogsWebSocket(string id)
+        {
+            if (!HttpContext.WebSockets.IsWebSocketRequest)
+                return;
+
+            using var ws = await HttpContext.WebSockets.AcceptWebSocketAsync();
+
+            var jsonOpts = new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            };
+
+            // Start streaming container logs directly (no replay of pipeline logs)
+            var channel = _svc.Subscribe(id);
+            try
+            {
+                while (!HttpContext.RequestAborted.IsCancellationRequested && ws.State == WebSocketState.Open)
+                {
+                    var hasItem = await channel.Reader.WaitToReadAsync(HttpContext.RequestAborted);
+                    if (!hasItem) break;
+
+                    while (channel.Reader.TryRead(out var entry))
+                    {
+                        var bytes = JsonSerializer.SerializeToUtf8Bytes(entry, jsonOpts);
+                        await ws.SendAsync(bytes, WebSocketMessageType.Text, true, HttpContext.RequestAborted);
+                        if (entry.Level == "done")
+                            break;
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                _svc.Unsubscribe(id, channel);
+                if (ws.State == WebSocketState.Open)
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
             }
         }
 
