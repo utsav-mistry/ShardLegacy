@@ -53,6 +53,47 @@ namespace ShardLegacy.Server.Services
 
             // Write the main nginx.conf
             WriteMainNginxConf();
+
+            // Ensure nginx:alpine image is present
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "docker",
+                    Arguments = "images -q nginx:alpine",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using var proc = new Process { StartInfo = psi };
+                proc.Start();
+                var output = proc.StandardOutput.ReadToEnd();
+                proc.WaitForExit();
+                if (string.IsNullOrWhiteSpace(output))
+                {
+                    _logger.LogInformation("nginx:alpine image not found. Pulling from Docker Hub...");
+                    var pullPsi = new ProcessStartInfo
+                    {
+                        FileName = "docker",
+                        Arguments = "pull nginx:alpine",
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+                    using var pullProc = new Process { StartInfo = pullPsi };
+                    pullProc.Start();
+                    pullProc.StandardOutput.ReadToEnd();
+                    pullProc.StandardError.ReadToEnd();
+                    pullProc.WaitForExit();
+                    _logger.LogInformation("nginx:alpine image pulled successfully.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to ensure nginx:alpine image is present. Nginx container may fail to start if image is missing.");
+            }
         }
 
         public async Task InitializeAsync()
@@ -150,6 +191,7 @@ namespace ShardLegacy.Server.Services
             {
                 // ── STAGE 0: Clone / Scan ──────────────────────────────
                 SetStage(deployment, 0, "running");
+                await Task.Delay(10);
                 await Emit(deployment, "step", "Scanning project source...", "clone");
 
                 var scan = await ScanSource(request.Source);
@@ -157,6 +199,8 @@ namespace ShardLegacy.Server.Services
                 {
                     await Emit(deployment, "error", scan.Error, "clone");
                     SetStage(deployment, 0, "failed");
+                    await Task.Delay(10);
+                    await Emit(deployment, "step", "Clone failed.", "clone");
                     deployment.Status = "failed";
                     await Finish(deployment, sw);
                     return;
@@ -174,12 +218,14 @@ namespace ShardLegacy.Server.Services
                 await Emit(deployment, "info", $"Docker file: {selectedFile}", "clone");
                 await Emit(deployment, "success", "Source analyzed successfully.", "clone");
                 SetStage(deployment, 0, "completed");
+                await Task.Delay(10);
 
                 var projectPath = scan.LocalPath;
                 var isCompose = selectedFile.Contains("compose", StringComparison.OrdinalIgnoreCase);
 
                 // ── STAGE 1: Environment ───────────────────────────────
                 SetStage(deployment, 1, "running");
+                await Task.Delay(10);
                 await Emit(deployment, "step", "Configuring environment...", "environment");
 
                 var adjective = Adjectives[Random.Shared.Next(Adjectives.Length)];
@@ -207,9 +253,11 @@ namespace ShardLegacy.Server.Services
 
                 await Emit(deployment, "success", "Environment ready.", "environment");
                 SetStage(deployment, 1, "completed");
+                await Task.Delay(10);
 
                 // ── STAGE 2: Docker Build ──────────────────────────────
                 SetStage(deployment, 2, "running");
+                await Task.Delay(10);
                 await Emit(deployment, "step", "Building Docker image...", "build");
 
                 if (isCompose)
@@ -225,6 +273,8 @@ namespace ShardLegacy.Server.Services
                     {
                         await Emit(deployment, "error", $"Build failed: {Tail(build.StdErr)}", "build");
                         SetStage(deployment, 2, "failed");
+                        await Task.Delay(10);
+                        await Emit(deployment, "step", "Build failed.", "build");
                         deployment.Status = "failed";
                         await Finish(deployment, sw);
                         return;
@@ -245,6 +295,8 @@ namespace ShardLegacy.Server.Services
                     {
                         await Emit(deployment, "error", $"Build failed: {Tail(build.StdErr)}", "build");
                         SetStage(deployment, 2, "failed");
+                        await Task.Delay(10);
+                        await Emit(deployment, "step", "Build failed.", "build");
                         deployment.Status = "failed";
                         await Finish(deployment, sw);
                         return;
@@ -252,9 +304,11 @@ namespace ShardLegacy.Server.Services
                     await Emit(deployment, "success", "Image built successfully.", "build");
                 }
                 SetStage(deployment, 2, "completed");
+                await Task.Delay(10);
 
                 // ── STAGE 3: Container Deploy ──────────────────────────
                 SetStage(deployment, 3, "running");
+                await Task.Delay(10);
                 await Emit(deployment, "step", "Starting container...", "deploy");
 
                 if (isCompose)
@@ -269,6 +323,8 @@ namespace ShardLegacy.Server.Services
                     {
                         await Emit(deployment, "error", $"Start failed: {Tail(up.StdErr)}", "deploy");
                         SetStage(deployment, 3, "failed");
+                        await Task.Delay(10);
+                        await Emit(deployment, "step", "Start failed.", "deploy");
                         deployment.Status = "failed";
                         await Finish(deployment, sw);
                         return;
@@ -326,6 +382,8 @@ namespace ShardLegacy.Server.Services
                     {
                         await Emit(deployment, "error", "Could not start container on any port.", "deploy");
                         SetStage(deployment, 3, "failed");
+                        await Task.Delay(10);
+                        await Emit(deployment, "step", "Container start failed.", "deploy");
                         deployment.Status = "failed";
                         await Finish(deployment, sw);
                         return;
@@ -336,9 +394,11 @@ namespace ShardLegacy.Server.Services
                     await Emit(deployment, "success", $"Container running: {containerId}", "deploy");
                 }
                 SetStage(deployment, 3, "completed");
+                await Task.Delay(10);
 
                 // ── STAGE 4: Health Check ──────────────────────────────
                 SetStage(deployment, 4, "running");
+                await Task.Delay(10);
                 await Emit(deployment, "step", "Running health checks...", "healthcheck");
 
                 var healthy = false;
@@ -377,9 +437,11 @@ namespace ShardLegacy.Server.Services
                         "Health checks inconclusive. Container may need more startup time.", "healthcheck");
 
                 SetStage(deployment, 4, "completed");
+                await Task.Delay(10);
 
                 // ── STAGE 5: Nginx Proxy ───────────────────────────────
                 SetStage(deployment, 5, "running");
+                await Task.Delay(10);
                 await Emit(deployment, "step", "Setting up reverse proxy...", "proxy");
 
                 await EnsureNginxRunning(deployment);
@@ -389,6 +451,7 @@ namespace ShardLegacy.Server.Services
                 await Emit(deployment, "success",
                     $"Reverse proxy configured: {subdomain}", "proxy");
                 SetStage(deployment, 5, "completed");
+                await Task.Delay(10);
 
                 // ── DONE ───────────────────────────────────────────────
                 deployment.Status = "running";
